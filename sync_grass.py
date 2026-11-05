@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitLab 커밋 활동을 빈 커밋으로 복제해서 GitHub 잔디를 심는 스크립트.
+"""GitLab 커밋 활동을 코드 없는 커밋으로 복제해서 GitHub 잔디를 심는 스크립트.
 
 코드는 전혀 가져오지 않고, 커밋 메타데이터(SHA, author date, author email)만 읽는다.
 
@@ -16,12 +16,11 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
 GITLAB_URL = os.environ.get("GITLAB_URL", "https://lab.ssafy.com").rstrip("/")
-TOKEN = os.environ["GITLAB_TOKEN"]
-EMAILS = {e.strip().lower() for e in os.environ["GITLAB_EMAILS"].split(",") if e.strip()}
 STATE_FILE = "synced.json"
 
 
@@ -29,7 +28,7 @@ def api_get(path, **params):
     """GitLab API 호출 (한 페이지)."""
     qs = urllib.parse.urlencode(params)
     url = f"{GITLAB_URL}/api/v4/{path}?{qs}"
-    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": TOKEN})
+    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"].strip()})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.load(resp)
 
@@ -47,56 +46,85 @@ def api_get_all(path, **params):
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return set(json.load(f)["synced_shas"])
-    return set()
+    # 작업 중 멈추더라도 실제로 생성된 커밋까지만 동기화된 것으로 본다.
+    tracked = subprocess.check_output(["git", "ls-tree", "HEAD", "--", STATE_FILE])
+    if not tracked:
+        return set()
+    state = subprocess.check_output(["git", "show", f"HEAD:{STATE_FILE}"])
+    return set(json.loads(state)["synced_shas"])
 
 
 def save_state(shas):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({"synced_shas": sorted(shas)}, f, indent=1)
+        f.write("\n")
 
 
 def main():
+    if not os.environ.get("GITLAB_TOKEN", "").strip():
+        sys.exit("GITLAB_TOKEN을 GitHub Actions Secrets에 설정하세요.")
+    emails = {
+        email.strip().lower()
+        for email in os.environ.get("GITLAB_EMAILS", "").split(",")
+        if email.strip()
+    }
+    if not emails:
+        sys.exit("GITLAB_EMAILS에 GitLab 커밋 작성자 이메일을 설정하세요.")
+
     synced = load_state()
-
     projects = api_get_all("projects", membership="true", simple="true")
-    print(f"프로젝트 {len(projects)}개 조회됨")
+    print(f"GitLab 프로젝트 {len(projects)}개 조회됨", flush=True)
+    if not projects:
+        print("::warning::조회된 프로젝트가 없습니다. GitLab 토큰의 계정과 프로젝트 접근 권한을 확인하세요.")
 
-    new_commits = []  # (sha, authored_date)
-    for p in projects:
+    matched = set()
+    new_by_sha = {}
+    inaccessible = 0
+    for project in projects:
         try:
-            commits = api_get_all(f"projects/{p['id']}/repository/commits")
-        except Exception as e:
-            print(f"  [skip] {p['path_with_namespace']}: {e}")
+            commits = api_get_all(
+                f"projects/{project['id']}/repository/commits", all="true"
+            )
+        except urllib.error.HTTPError as error:
+            if error.code not in (403, 404):
+                raise
+            inaccessible += 1
             continue
-        mine = [
-            c for c in commits
-            if c["author_email"].lower() in EMAILS and c["id"] not in synced
-        ]
-        if mine:
-            print(f"  {p['path_with_namespace']}: 새 커밋 {len(mine)}개")
-        new_commits.extend((c["id"], c["authored_date"]) for c in mine)
+        for commit in commits:
+            if (commit.get("author_email") or "").strip().lower() in emails:
+                sha = commit["id"]
+                matched.add(sha)
+                if sha not in synced:
+                    new_by_sha[sha] = commit["authored_date"]
 
-    # 같은 커밋이 포크 등 여러 프로젝트에 보일 수 있으므로 SHA로 중복 제거
-    new_commits = sorted(set(new_commits), key=lambda x: x[1])
+    if inaccessible:
+        print(
+            f"::warning::{inaccessible}개 프로젝트의 커밋을 읽을 수 없습니다 (HTTP 403/404). "
+            "누락된 커밋이 있다면 해당 GitLab 저장소 접근 권한을 확인하세요."
+        )
+        if inaccessible == len(projects):
+            sys.exit("모든 프로젝트의 커밋 조회가 실패했습니다.")
 
+    new_commits = sorted(new_by_sha.items(), key=lambda item: (item[1], item[0]))
+    print(f"조회 가능한 프로젝트에서 작성자 일치 {len(matched)}개, 새 커밋 {len(new_commits)}개")
+    if projects and not matched:
+        print("::warning::작성자가 일치하는 커밋이 없습니다. GITLAB_EMAILS를 확인하세요.")
     if not new_commits:
-        print("새로 동기화할 커밋 없음")
         return
 
-    print(f"총 {len(new_commits)}개 빈 커밋 생성 중...")
-    synced.update(sha for sha, _ in new_commits)
-    save_state(synced)
+    print(f"총 {len(new_commits)}개 동기화 커밋 생성 중...")
 
-    for i, (sha, date) in enumerate(new_commits):
+    for sha, date in new_commits:
+        # 각 커밋에 해당 SHA를 기록해야 중간에 실패해도 이어서 실행할 수 있다.
+        synced.add(sha)
+        save_state(synced)
+        subprocess.run(["git", "add", STATE_FILE], check=True)
         env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
-        cmd = ["git", "commit", "-q", "--allow-empty", "-m", f"grass: {sha[:8]}"]
-        if i == 0:
-            # 첫 커밋에 갱신된 상태 파일을 함께 담는다
-            subprocess.run(["git", "add", STATE_FILE], check=True)
-        subprocess.run(cmd, check=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", f"grass: {sha[:8]}", "--", STATE_FILE],
+            check=True,
+            env=env,
+        )
 
     print("완료. git push 하면 잔디에 반영된다.")
 
