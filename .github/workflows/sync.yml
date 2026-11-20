@@ -2,15 +2,20 @@ name: Sync GitLab grass
 
 on:
   schedule:
-    - cron: "0 15 * * *" # 매일 UTC 15:00 = KST 자정
+    - cron: "17 15 * * *" # 매일 KST 00:17, 정각 혼잡을 피함 (실행 지연 가능)
   workflow_dispatch: # Actions 탭에서 수동 실행 가능
 
 permissions:
   contents: write
 
+concurrency:
+  group: gitlab-grass-sync-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:

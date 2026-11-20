@@ -60,6 +60,32 @@ def save_state(shas):
         f.write("\n")
 
 
+def write_summary(project_count, matched_count, created_count, synced_count, inaccessible):
+    """Actions 실행 화면에 조회 범위와 실제 반영 건수를 남긴다."""
+    lines = [
+        "## GitLab grass sync",
+        "",
+        "| 항목 | 개수 |",
+        "| --- | ---: |",
+        f"| 조회 프로젝트 | {project_count} |",
+        f"| 작성자 일치 커밋 (중복 제외) | {matched_count} |",
+        f"| 이번에 생성한 커밋 | {created_count} |",
+        f"| 누적 동기화 커밋 | {synced_count} |",
+        f"| 접근 불가 프로젝트 | {len(inaccessible)} |",
+        "",
+        "커밋은 GitLab의 원래 작성 날짜에 반영됩니다. GitHub 잔디 표시는 최대 24시간 걸릴 수 있습니다.",
+    ]
+    if inaccessible:
+        lines += ["", "### 확인이 필요한 GitLab 프로젝트", ""]
+        for project_id, status in inaccessible:
+            lines.append(f"- 프로젝트 ID `{project_id}`: HTTP {status}")
+        lines += ["", "해당 프로젝트의 GitLab 접근 권한 또는 저장소 사용 여부를 확인하세요."]
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as summary:
+            summary.write("\n".join(lines) + "\n")
+
+
 def main():
     if not os.environ.get("GITLAB_TOKEN", "").strip():
         sys.exit("GITLAB_TOKEN을 GitHub Actions Secrets에 설정하세요.")
@@ -75,11 +101,11 @@ def main():
     projects = api_get_all("projects", membership="true", simple="true")
     print(f"GitLab 프로젝트 {len(projects)}개 조회됨", flush=True)
     if not projects:
-        print("::warning::조회된 프로젝트가 없습니다. GitLab 토큰의 계정과 프로젝트 접근 권한을 확인하세요.")
+        sys.exit("조회된 프로젝트가 없습니다. GitLab 토큰의 계정과 프로젝트 접근 권한을 확인하세요.")
 
     matched = set()
     new_by_sha = {}
-    inaccessible = 0
+    inaccessible = []
     for project in projects:
         try:
             commits = api_get_all(
@@ -88,7 +114,12 @@ def main():
         except urllib.error.HTTPError as error:
             if error.code not in (403, 404):
                 raise
-            inaccessible += 1
+            inaccessible.append((project["id"], error.code))
+            print(
+                f"::warning::GitLab 프로젝트 ID {project['id']}: HTTP {error.code}. "
+                "프로젝트 접근 권한 또는 저장소 사용 여부를 확인하세요.",
+                flush=True,
+            )
             continue
         for commit in commits:
             if (commit.get("author_email") or "").strip().lower() in emails:
@@ -99,10 +130,11 @@ def main():
 
     if inaccessible:
         print(
-            f"::warning::{inaccessible}개 프로젝트의 커밋을 읽을 수 없습니다 (HTTP 403/404). "
+            f"::warning::{len(inaccessible)}개 프로젝트의 커밋을 읽을 수 없습니다 (HTTP 403/404). "
             "누락된 커밋이 있다면 해당 GitLab 저장소 접근 권한을 확인하세요."
         )
-        if inaccessible == len(projects):
+        if len(inaccessible) == len(projects):
+            write_summary(len(projects), len(matched), 0, len(synced), inaccessible)
             sys.exit("모든 프로젝트의 커밋 조회가 실패했습니다.")
 
     new_commits = sorted(new_by_sha.items(), key=lambda item: (item[1], item[0]))
@@ -110,6 +142,7 @@ def main():
     if projects and not matched:
         print("::warning::작성자가 일치하는 커밋이 없습니다. GITLAB_EMAILS를 확인하세요.")
     if not new_commits:
+        write_summary(len(projects), len(matched), 0, len(synced), inaccessible)
         return
 
     print(f"총 {len(new_commits)}개 동기화 커밋 생성 중...")
@@ -126,6 +159,7 @@ def main():
             env=env,
         )
 
+    write_summary(len(projects), len(matched), len(new_commits), len(synced), inaccessible)
     print("완료. git push 하면 잔디에 반영된다.")
 
 
